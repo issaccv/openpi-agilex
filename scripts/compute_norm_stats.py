@@ -277,7 +277,7 @@ def main(config_name: str, max_frames: int | None = None):
     data_config = config.data.create(config.assets_dirs, config.model)
 
     # Try to load existing stats from meta/stats.json
-    output_path = config.assets_dirs / data_config.repo_id
+    output_path = config.assets_dirs / (data_config.asset_id or data_config.repo_id)
     # Get RepackTransform from data_config to map dataset keys to model keys
     repack_transform = None
     if hasattr(data_config, 'repack_transforms') and data_config.repack_transforms:

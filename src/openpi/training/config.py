@@ -21,6 +21,7 @@ import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
+import openpi.shared.nnx_utils as nnx_utils
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
 import openpi.training.misc.roboarena_config as roboarena_config
@@ -1002,9 +1003,9 @@ _CONFIGS = [
         data=LeRobotAlohaDataConfig(
             repo_id="/home/agilex/dataset-pika_aloha-joint",
             assets=AssetsConfig(
-                assets_dir="/home/agilex/dataset-pika_aloha-joint",
-                # assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets",
-                # asset_id="trossen",
+                #assets_dir="/home/agilex/dataset-pika_aloha-joint",
+                assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets",
+                asset_id="trossen",
             ),
             default_prompt="null",
             # base_config=DataConfig(
@@ -1067,6 +1068,86 @@ _CONFIGS = [
         ).get_freeze_filter(),
         ema_decay=None,  # Turn off EMA for LoRA finetuning
         batch_size=16,
+    ),
+    TrainConfig(
+        name="pi05_magic_cobot_pick",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotAlohaDataConfig(
+            repo_id="HITdongdong/magic_cobot_pick_lerobot",
+            adapt_to_pi=False,
+            use_delta_joint_actions=True,
+            default_prompt="pick",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "base_0_rgb": "observation.images.front",
+                                "left_wrist_0_rgb": "observation.images.left",
+                                "right_wrist_0_rgb": "observation.images.right",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                        }
+                    )
+                ]
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+    ),
+    TrainConfig(
+        name="pi05_aloha_lora_16g",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m",
+        ),
+        data=LeRobotAlohaDataConfig(
+            repo_id="/home/agilex/data_lerobot",
+            assets=AssetsConfig(asset_id="cobot_magic_local"),
+            adapt_to_pi=False,
+            use_delta_joint_actions=True,
+            default_prompt="pick",
+            base_config=DataConfig(prompt_from_task=True),
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "base_0_rgb": "observation.images.front",
+                                "left_wrist_0_rgb": "observation.images.left",
+                                "right_wrist_0_rgb": "observation.images.right",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                        }
+                    )
+                ]
+            ),
+        ),
+        #weight_loader=weight_loaders.CheckpointWeightLoader("/home/agilex/.cache/openpi/pi05_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/home/agilex/.cache/huggingface/hub/models--HITdongdong--pi05_magic_cobot_pick_jax_step2000/snapshots/5cceaa5c4abd33d31cab38bfb16ada365c057106/params"),
+        freeze_filter=nnx.Any(
+            nnx_utils.PathRegex(".*img/(embedding|pos_embedding|Transformer/encoderblock).*"),
+            pi0_config.Pi0Config(
+                pi05=True,
+                paligemma_variant="gemma_2b_lora",
+                action_expert_variant="gemma_300m",
+            ).get_freeze_filter(),
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=300,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=5e-6,
+        ),
+        ema_decay=None,
+        batch_size=2,
+        num_workers=2,
+        num_train_steps=30_000,
+        save_interval=3_000,
+        keep_period=3_000,
+        wandb_enabled=False,
     ),
 
     TrainConfig(

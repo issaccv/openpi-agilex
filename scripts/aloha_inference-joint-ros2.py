@@ -4,15 +4,19 @@
 #!/usr/bin/python3
 """
 
-import torch
+from contextlib import nullcontext
+try:
+    import torch
+except ImportError:
+    torch = None
 import numpy as np
 import os
 import pickle
 import argparse
-from einops import rearrange
 from collections import deque
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 from std_msgs.msg import Header, String
 from geometry_msgs.msg import Twist
 from sensor_msgs.msg import JointState, Image, CameraInfo
@@ -20,14 +24,26 @@ from nav_msgs.msg import Odometry
 from geometry_msgs.msg import PoseStamped
 from cv_bridge import CvBridge
 import threading
-from torchvision import transforms
+import traceback
 import cv2
 # from aloha_msgs.srv import StatusSrv, StatusSrvRequest, StatusSrvResponse
 from functools import partial
-from tf_transformations import quaternion_from_euler, euler_from_quaternion
+try:
+    from tf_transformations import quaternion_from_euler, euler_from_quaternion
+except (ImportError, AttributeError):
+    from scipy.spatial.transform import Rotation as _ScipyRotation
+
+    def quaternion_from_euler(ai, aj, ak):
+        return _ScipyRotation.from_euler('xyz', [ai, aj, ak]).as_quat()
+
+    def euler_from_quaternion(quaternion):
+        return _ScipyRotation.from_quat(quaternion).as_euler('xyz')
 import sys
 from scipy.spatial import geometric_slerp
-import open3d as o3d
+try:
+    import open3d as o3d
+except ImportError:
+    o3d = None
 from sensor_msgs.msg import PointCloud2, PointField#, point_cloud2
 from tf2_ros import Buffer, TransformListener
 import math
@@ -40,8 +56,6 @@ import yaml
 import dataclasses
 import enum
 import logging
-
-import tyro
 
 # from openpi.policies import policy as _policy
 # from openpi.policies import policy_config as _policy_config
@@ -121,6 +135,10 @@ inference_thread = None
 inference_lock = threading.Lock()
 inference_actions = None
 inference_timestep = None
+inference_state = None
+inference_error = None
+inference_duration = None
+inference_rpc_duration = None
 pre_instruction = ""
 pre_instruction_attention_vector = None
 pre_instruction_input_ids = None
@@ -377,7 +395,15 @@ def color_depth_to_point_cloud(color_image, depth_image, color_intrinsic, depth_
     return point_cloud
 
 
-def get_camera_color(camera_names, history_num, camera_color):
+def _hwc_to_chw(img: np.ndarray) -> np.ndarray:
+    return np.transpose(img, (2, 0, 1))
+
+
+def _chw_to_hwc(img: np.ndarray) -> np.ndarray:
+    return np.transpose(img, (1, 2, 0))
+
+
+def get_camera_color(camera_names, history_num, camera_color, pad_to_1280x720=False):
     colorss = []
     for cam_name in camera_names:
         colors = []
@@ -385,27 +411,28 @@ def get_camera_color(camera_names, history_num, camera_color):
             color = camera_color[cam_name][i]
             color = cv2.imencode('.jpg', color)[1].tobytes()
             color = cv2.imdecode(np.frombuffer(color, np.uint8), cv2.IMREAD_COLOR)
-            default_width = 1280
-            default_height = 720
-            camera_width = color.shape[1]
-            camera_height = color.shape[0]
-            width_diff = default_width - camera_width
-            height_diff = default_height - camera_height
-            if width_diff < 0:
-                clip_width = abs(width_diff) // 2
-                color = color[:, clip_width:clip_width + default_width]
-            elif width_diff > 0:
-                add_width = width_diff // 2
-                top, bottom, left, right = 0, 0, add_width, add_width
-                color = cv2.copyMakeBorder(color, top, bottom, left, right, cv2.BORDER_CONSTANT, value=0)
-            if height_diff < 0:
-                clip_height = abs(height_diff) // 2
-                color = color[clip_height:clip_height + default_height, :]
-            elif height_diff > 0:
-                add_height = height_diff // 2
-                top, bottom, left, right = add_height, add_height, 0, 0
-                color = cv2.copyMakeBorder(color, top, bottom, left, right, cv2.BORDER_CONSTANT,value=0)
-            color = rearrange(color, 'h w c -> c h w')
+            if pad_to_1280x720:
+                default_width = 1280
+                default_height = 720
+                camera_width = color.shape[1]
+                camera_height = color.shape[0]
+                width_diff = default_width - camera_width
+                height_diff = default_height - camera_height
+                if width_diff < 0:
+                    clip_width = abs(width_diff) // 2
+                    color = color[:, clip_width:clip_width + default_width]
+                elif width_diff > 0:
+                    add_width = width_diff // 2
+                    top, bottom, left, right = 0, 0, add_width, add_width
+                    color = cv2.copyMakeBorder(color, top, bottom, left, right, cv2.BORDER_CONSTANT, value=0)
+                if height_diff < 0:
+                    clip_height = abs(height_diff) // 2
+                    color = color[clip_height:clip_height + default_height, :]
+                elif height_diff > 0:
+                    add_height = height_diff // 2
+                    top, bottom, left, right = add_height, add_height, 0, 0
+                    color = cv2.copyMakeBorder(color, top, bottom, left, right, cv2.BORDER_CONSTANT, value=0)
+            color = _hwc_to_chw(color)
             colors.append(color)
         colorss.append(np.stack(colors, axis=0))
     colorss = np.stack(colorss, axis=0)
@@ -449,6 +476,8 @@ def get_camera_depth(camera_names, history_num, camera_depth):
 def get_camera_point_cloud(camera_names, history_num, voxel_size, use_farthest_point_down_sample,
                            point_num, use_camera_point_cloud_rgb,
                            camera_point_cloud, color_extrinsics, point_cloud_extrinsics):
+    if o3d is None:
+        raise ImportError("open3d is required when use_camera_point_cloud is enabled")
     camera_point_cloudss = []
     for cam_id, cam_name in enumerate(camera_names):
         camera_point_clouds = []
@@ -577,11 +606,18 @@ def inference_process(args, t, ros_operator, policy):
     global inference_lock
     global inference_actions
     global inference_timestep
+    global inference_state
+    global inference_error
+    global inference_duration
+    global inference_rpc_duration
     global pre_instruction
     global pre_instruction_attention_vector
     global pre_instruction_input_ids
     global prev_action_chunk
     global pre_instruction_attention_mask
+    infer_t0 = time.perf_counter()
+    with inference_lock:
+        inference_error = None
     bridge = CvBridge()
 
     (instruction,
@@ -597,7 +633,12 @@ def inference_process(args, t, ros_operator, policy):
     for j in range(len(args.camera_color_names)):
         camera_color_dict[args.camera_color_names[j]] = [bridge.imgmsg_to_cv2(camera_colors[i][j], 'rgb8') for i in range(args.obs_history_num)]
     if args.use_camera_color:
-        camera_color = get_camera_color(args.camera_color_names, args.obs_history_num, camera_color_dict)  # b, num_camera, history, c, h, w
+        camera_color = get_camera_color(
+            args.camera_color_names,
+            args.obs_history_num,
+            camera_color_dict,
+            pad_to_1280x720=args.pad_to_1280x720,
+        )  # b, num_camera, history, c, h, w
 
     if args.use_camera_color_depth_to_point_cloud or args.use_camera_depth:
         for j in range(len(args.camera_depth_names)):
@@ -706,9 +747,9 @@ def inference_process(args, t, ros_operator, policy):
         # TODO: merge the following operations into the `get_camera_color' function.
         # extract CHW tensor  (3,480,640) float32 0-255 → numpy HWC uint8 resized 224×224 → back to CHW
         img_chw = camera_color[0, cam_idx, 0].astype(np.uint8)
-        img_hwc  = rearrange(img_chw, "c h w -> h w c")
-        img_hwc  = image_tools.resize_with_pad(img_hwc, RENDER_H, RENDER_W)
-        img_chw  = rearrange(img_hwc, "h w c -> c h w")
+        img_hwc = _chw_to_hwc(img_chw)
+        img_hwc = image_tools.resize_with_pad(img_hwc, RENDER_H, RENDER_W)
+        img_chw = _hwc_to_chw(img_hwc)
         images[name_map[cam_name]] = img_chw
 
     observation = {
@@ -722,64 +763,75 @@ def inference_process(args, t, ros_operator, policy):
     # Normalize gripper dims 6 and 13 in state to [0, 1] (1=closed, 0=open, flip=True)
     # observation["state"] = normalize_gripper_dims(observation["state"], dims=[6, 13], original_min=0.0, original_max=0.08, new_min=0.0, new_max=1.0, flip=True)
 
-    # RTC推理或标准推理
-    if args.use_rtc_guidance and prev_action_chunk is not None:
-        # 使用RTC引导推理
-        action_pred = policy.infer_with_rtc_guidance(observation, prev_action_chunk,
-                                                     executed_steps=args.pos_lookahead_step)
-        print(f"RTC Guided Inference: prev_chunk_shape={prev_action_chunk.shape}")
-    else:
-        # 标准推理
-        action_pred = policy.infer(observation)
-        if args.use_rtc_guidance:
-            print("RTC First Inference (no guidance)")
+    try:
+        # RTC推理或标准推理
+        rpc_t0 = time.perf_counter()
+        if args.use_rtc_guidance and prev_action_chunk is not None:
+            # 使用RTC引导推理
+            action_pred = policy.infer_with_rtc_guidance(observation, prev_action_chunk,
+                                                         executed_steps=args.pos_lookahead_step)
+            print(f"RTC Guided Inference: prev_chunk_shape={prev_action_chunk.shape}")
+        else:
+            # 标准推理
+            action_pred = policy.infer(observation)
+            if args.use_rtc_guidance:
+                print("RTC First Inference (no guidance)")
+        rpc_dur = time.perf_counter() - rpc_t0
+            
+        action = action_pred['actions']
+        action = action.copy()
         
-    action = action_pred['actions']
-    action = action.copy()
-    
-    # action = tree.map_structure(lambda x: x[:args.chunk_size, ...], action_pred)['actions']  # NOTE: has been revised to fit for the pi0 model
-    # NOTE: since the actual robot gripper requires a scope [0, 0.08], we need to normalize our action output into this.
-    # action = normalize_gripper_dims(action, dims=[6, 13], original_min=0.0, original_max=1.0, new_min=0.0, new_max=0.08, flip=True)
-    
-    # 更新前一次action chunk用于下次RTC推理
-    if args.use_rtc_guidance:
-        prev_action_chunk = action.copy()
+        # action = tree.map_structure(lambda x: x[:args.chunk_size, ...], action_pred)['actions']  # NOTE: has been revised to fit for the pi0 model
+        # NOTE: since the actual robot gripper requires a scope [0, 0.08], we need to normalize our action output into this.
+        # action = normalize_gripper_dims(action, dims=[6, 13], original_min=0.0, original_max=1.0, new_min=0.0, new_max=0.08, flip=True)
+        
+        # 更新前一次action chunk用于下次RTC推理
+        if args.use_rtc_guidance:
+            prev_action_chunk = action.copy()
 
-    if args.use_arm_end_pose > 1:
-        if args.use_pose6d:
-            action_new = np.zeros((action.shape[0], len(args.arm_end_pose_names) * args.arm_end_pose_dim))
-            for i in range(action.shape[0]):
-                for j in range(len(args.arm_end_pose_names)):
-                    action_new[i][(j + 1) * args.arm_end_pose_dim - 1] = action[i][(j + 1) * 10 - 1]
-                    xyzrpy = matrix_to_xyzrpy(pose6d_to_matrix(action[i][j*10+0:j*10+9], args.use_row_pose6d))
-                    action_new[i][j*args.arm_end_pose_dim+0] = xyzrpy[0]
-                    action_new[i][j*args.arm_end_pose_dim+1] = xyzrpy[1]
-                    action_new[i][j*args.arm_end_pose_dim+2] = xyzrpy[2]
-                    action_new[i][j*args.arm_end_pose_dim+3] = xyzrpy[3]
-                    action_new[i][j*args.arm_end_pose_dim+4] = xyzrpy[4]
-                    action_new[i][j*args.arm_end_pose_dim+5] = xyzrpy[5]
-            action = action_new.copy()
-        if args.use_arm_end_pose_incre:
-            for i in range(action.shape[0]):
-                for j in range(len(args.arm_end_pose_names)):
-                    world_base_matrix = create_transformation_matrix(args.arm_base_link_in_world[j][0], args.arm_base_link_in_world[j][1], args.arm_base_link_in_world[j][2],
-                                                                        args.arm_base_link_in_world[j][3], args.arm_base_link_in_world[j][4], args.arm_base_link_in_world[j][5])
-                    world_base_matrix_inv = np.linalg.inv(world_base_matrix)
-                    end_pose_matrix = create_transformation_matrix(action[i][j*args.arm_end_pose_dim+0], action[i][j*args.arm_end_pose_dim+1], action[i][j*args.arm_end_pose_dim+2],
-                                                                    action[i][j*args.arm_end_pose_dim+3], action[i][j*args.arm_end_pose_dim+4], action[i][j*args.arm_end_pose_dim+5])
-                    end_pose_matrix = np.dot(world_base_matrix_inv, end_pose_matrix)
-                    xyzrpy = matrix_to_xyzrpy(end_pose_matrix)
-                    action[i][j * args.arm_end_pose_dim + 0] = xyzrpy[0]
-                    action[i][j * args.arm_end_pose_dim + 1] = xyzrpy[1]
-                    action[i][j * args.arm_end_pose_dim + 2] = xyzrpy[2]
-                    action[i][j * args.arm_end_pose_dim + 3] = xyzrpy[3]
-                    action[i][j * args.arm_end_pose_dim + 4] = xyzrpy[4]
-                    action[i][j * args.arm_end_pose_dim + 5] = xyzrpy[5]
+        if args.use_arm_end_pose > 1:
+            if args.use_pose6d:
+                action_new = np.zeros((action.shape[0], len(args.arm_end_pose_names) * args.arm_end_pose_dim))
+                for i in range(action.shape[0]):
+                    for j in range(len(args.arm_end_pose_names)):
+                        action_new[i][(j + 1) * args.arm_end_pose_dim - 1] = action[i][(j + 1) * 10 - 1]
+                        xyzrpy = matrix_to_xyzrpy(pose6d_to_matrix(action[i][j*10+0:j*10+9], args.use_row_pose6d))
+                        action_new[i][j*args.arm_end_pose_dim+0] = xyzrpy[0]
+                        action_new[i][j*args.arm_end_pose_dim+1] = xyzrpy[1]
+                        action_new[i][j*args.arm_end_pose_dim+2] = xyzrpy[2]
+                        action_new[i][j*args.arm_end_pose_dim+3] = xyzrpy[3]
+                        action_new[i][j*args.arm_end_pose_dim+4] = xyzrpy[4]
+                        action_new[i][j*args.arm_end_pose_dim+5] = xyzrpy[5]
+                action = action_new.copy()
+            if args.use_arm_end_pose_incre:
+                for i in range(action.shape[0]):
+                    for j in range(len(args.arm_end_pose_names)):
+                        world_base_matrix = create_transformation_matrix(args.arm_base_link_in_world[j][0], args.arm_base_link_in_world[j][1], args.arm_base_link_in_world[j][2],
+                                                                            args.arm_base_link_in_world[j][3], args.arm_base_link_in_world[j][4], args.arm_base_link_in_world[j][5])
+                        world_base_matrix_inv = np.linalg.inv(world_base_matrix)
+                        end_pose_matrix = create_transformation_matrix(action[i][j*args.arm_end_pose_dim+0], action[i][j*args.arm_end_pose_dim+1], action[i][j*args.arm_end_pose_dim+2],
+                                                                        action[i][j*args.arm_end_pose_dim+3], action[i][j*args.arm_end_pose_dim+4], action[i][j*args.arm_end_pose_dim+5])
+                        end_pose_matrix = np.dot(world_base_matrix_inv, end_pose_matrix)
+                        xyzrpy = matrix_to_xyzrpy(end_pose_matrix)
+                        action[i][j * args.arm_end_pose_dim + 0] = xyzrpy[0]
+                        action[i][j * args.arm_end_pose_dim + 1] = xyzrpy[1]
+                        action[i][j * args.arm_end_pose_dim + 2] = xyzrpy[2]
+                        action[i][j * args.arm_end_pose_dim + 3] = xyzrpy[3]
+                        action[i][j * args.arm_end_pose_dim + 4] = xyzrpy[4]
+                        action[i][j * args.arm_end_pose_dim + 5] = xyzrpy[5]
 
-    inference_lock.acquire()
-    inference_actions = action[np.newaxis, :]  # 1, chunk_size, action_dim
-    inference_timestep = t
-    inference_lock.release()
+        infer_dur = time.perf_counter() - infer_t0
+        with inference_lock:
+            inference_actions = action[np.newaxis, :]  # 1, chunk_size, action_dim
+            inference_timestep = t
+            inference_state = robot_state[0, 0].copy()
+            inference_duration = infer_dur
+            inference_rpc_duration = rpc_dur
+    except Exception as exc:
+        traceback.print_exc()
+        with inference_lock:
+            inference_error = exc
+        return
 
 
 class RosOperator(Node):
@@ -817,20 +869,25 @@ class RosOperator(Node):
         self.robot_base_vel_history_list = []
 
         self.instruction_subscriber = self.create_subscription(String, self.args.instruction_topic, self.instruction_callback, 1)
-        self.camera_color_subscriber = [self.create_subscription(Image, self.args.camera_color_topics[i], partial(self.camera_color_callback, i), 1) for i in range(len(self.args.camera_color_names))]
-        self.camera_depth_subscriber = [self.create_subscription(Image, self.args.camera_depth_topics[i], partial(self.camera_depth_callback, i), 1) for i in range(len(self.args.camera_depth_names))]
-        self.camera_point_cloud_subscriber = [self.create_subscription(PointCloud2, self.args.camera_point_cloud_topics[i], partial(self.camera_point_cloud_callback, i), 1) for i in range(len(self.args.camera_point_cloud_names))]
-        self.arm_joint_state_subscriber = [self.create_subscription(JointState, self.args.arm_joint_state_topics[i], partial(self.arm_joint_state_callback, i), 1) for i in range(len(self.args.arm_joint_state_names))]
+        self.camera_color_subscriber = [self.create_subscription(Image, self.args.camera_color_topics[i], partial(self.camera_color_callback, i), qos_profile_sensor_data) for i in range(len(self.args.camera_color_names))]
+        self.camera_depth_subscriber = [self.create_subscription(Image, self.args.camera_depth_topics[i], partial(self.camera_depth_callback, i), qos_profile_sensor_data) for i in range(len(self.args.camera_depth_names))]
+        self.camera_point_cloud_subscriber = [self.create_subscription(PointCloud2, self.args.camera_point_cloud_topics[i], partial(self.camera_point_cloud_callback, i), qos_profile_sensor_data) for i in range(len(self.args.camera_point_cloud_names))]
+        self.arm_joint_state_subscriber = [self.create_subscription(JointState, self.args.arm_joint_state_topics[i], partial(self.arm_joint_state_callback, i), qos_profile_sensor_data) for i in range(len(self.args.arm_joint_state_names))]
         self.arm_end_pose_subscriber = [self.create_subscription(PoseStamped, self.args.arm_end_pose_topics[i], partial(self.arm_end_pose_callback, i), 1) for i in range(len(self.args.arm_end_pose_names))]
         self.robot_base_vel_subscriber = [self.create_subscription(Odometry, self.args.robot_base_vel_topics[i], partial(self.robot_base_vel_callback, i), 1) for i in range(len(self.args.robot_base_vel_names))]
 
-        self.camera_color_config_subscriber = [self.create_subscription(CameraInfo, self.args.camera_color_config_topics[i], partial(self.camera_color_config_callback, i), 1) for i in range(len(self.args.camera_color_names))]
-        self.camera_depth_config_subscriber = [self.create_subscription(CameraInfo, self.args.camera_depth_config_topics[i], partial(self.camera_depth_config_callback, i), 1) for i in range(len(self.args.camera_depth_names))]
-        self.camera_point_cloud_config_subscriber = [self.create_subscription(CameraInfo, self.args.camera_point_cloud_config_topics[i], partial(self.camera_point_cloud_config_callback, i), 1) for i in range(len(self.args.camera_point_cloud_names))]
+        self.camera_color_config_subscriber = [self.create_subscription(CameraInfo, self.args.camera_color_config_topics[i], partial(self.camera_color_config_callback, i), qos_profile_sensor_data) for i in range(len(self.args.camera_color_names))]
+        self.camera_depth_config_subscriber = [self.create_subscription(CameraInfo, self.args.camera_depth_config_topics[i], partial(self.camera_depth_config_callback, i), qos_profile_sensor_data) for i in range(len(self.args.camera_depth_names))]
+        self.camera_point_cloud_config_subscriber = [self.create_subscription(CameraInfo, self.args.camera_point_cloud_config_topics[i], partial(self.camera_point_cloud_config_callback, i), qos_profile_sensor_data) for i in range(len(self.args.camera_point_cloud_names))]
 
-        self.arm_joint_state_ctrl_publisher = [self.create_publisher(JointState, self.args.arm_joint_state_ctrl_topics[i], 10) for i in range(len(self.args.arm_joint_state_ctrl_topics))]
-        self.arm_end_pose_ctrl_publisher = [self.create_publisher(PoseStamped, self.args.arm_end_pose_ctrl_topics[i], 10) for i in range(len(self.args.arm_end_pose_ctrl_topics))]
-        self.robot_base_vel_ctrl_publisher = self.create_publisher(Twist, self.args.robot_base_vel_ctrl_topic, 10)
+        if self.args.dry_run:
+            self.arm_joint_state_ctrl_publisher = []
+            self.arm_end_pose_ctrl_publisher = []
+            self.robot_base_vel_ctrl_publisher = None
+        else:
+            self.arm_joint_state_ctrl_publisher = [self.create_publisher(JointState, self.args.arm_joint_state_ctrl_topics[i], 10) for i in range(len(self.args.arm_joint_state_ctrl_topics))]
+            self.arm_end_pose_ctrl_publisher = [self.create_publisher(PoseStamped, self.args.arm_end_pose_ctrl_topics[i], 10) for i in range(len(self.args.arm_end_pose_ctrl_topics))]
+            self.robot_base_vel_ctrl_publisher = self.create_publisher(Twist, self.args.robot_base_vel_ctrl_topic, 10)
 
         # self.inference_status_service = self.create_service(StatusSrv, self.args.aloha_inference_status_service, self.change_inference_status)
         self.inference_status = -1
@@ -855,10 +912,78 @@ class RosOperator(Node):
         self.model_inference_thread = threading.Thread(target=self.model_inference)
         self.model_inference_thread.start()
 
+    def _compute_ensemble_action(self, chunk_history, t, blend_total, ensemble_k):
+        """Compute ACT-style exponentially weighted action across overlapping chunks with cosine ramp-in."""
+        valid = [c for c in chunk_history if 0 <= (t - c["t_start"]) < c["actions"].shape[1]]
+        if not valid:
+            return None, 0
+        if len(valid) == 1:
+            c0 = valid[0]
+            return c0["actions"][0, t - c0["t_start"]].copy(), 1
+
+        def _weighted_avg(chunks):
+            if ensemble_k < 0 or len(chunks) == 1:
+                last = chunks[-1]
+                return last["actions"][0, t - last["t_start"]].copy()
+            ages = np.array([max(0, t - c["t_start"]) for c in chunks], dtype=np.float64)
+            weights = np.exp(-ensemble_k * (ages - ages.min()))
+            weights /= weights.sum()
+            acc = np.zeros_like(chunks[-1]["actions"][0, t - chunks[-1]["t_start"]], dtype=np.float64)
+            for w, c in zip(weights, chunks):
+                acc += w * c["actions"][0, t - c["t_start"]]
+            return acc.astype(chunks[-1]["actions"].dtype, copy=False)
+
+        full_action = _weighted_avg(valid)
+        older_action = _weighted_avg(valid[:-1])
+        newest = valid[-1]
+        steps_active = t - newest["applied_t"]
+        if blend_total > 0 and 0 <= steps_active < blend_total:
+            alpha = 0.5 * (1.0 - math.cos(math.pi * (steps_active + 1) / float(blend_total + 1)))
+            return ((1.0 - alpha) * older_action + alpha * full_action).astype(full_action.dtype, copy=False), len(valid)
+        return full_action, len(valid)
+
+    def _compute_chunk_jump(self, prev_action_vec, new_action_vec):
+        """Return max absolute arm-joint difference (rad) and joint label between two action vectors."""
+        arm_dim = self.args.arm_joint_state_dim
+        arm_names = self.args.arm_joint_state_names
+        dim_total = arm_dim * len(arm_names)
+        if dim_total == 0 or min(len(prev_action_vec), len(new_action_vec)) < dim_total:
+            return 0.0, "n/a"
+        arm_indices = [idx for idx in range(dim_total) if (idx % arm_dim) != (arm_dim - 1)]
+        if not arm_indices:
+            return 0.0, "n/a"
+        diffs = np.abs(
+            np.asarray(new_action_vec, dtype=np.float64)[arm_indices]
+            - np.asarray(prev_action_vec, dtype=np.float64)[arm_indices]
+        )
+        worst_pos = int(np.argmax(diffs))
+        worst_idx = arm_indices[worst_pos]
+        return float(diffs[worst_pos]), f"{arm_names[worst_idx // arm_dim]}.J{(worst_idx % arm_dim) + 1}"
+
+    def _record_chunk(self, chunk_history, new_actions, new_t_start, t, blend_total, ensemble_k, max_chunks):
+        """Compute jump diagnostics, prune expired chunks, and append the newly arrived chunk."""
+        prev_ref, _ = self._compute_ensemble_action(chunk_history, t, blend_total, ensemble_k)
+        if prev_ref is not None and 0 <= (t - new_t_start) < new_actions.shape[1]:
+            max_jump, jump_joint = self._compute_chunk_jump(prev_ref, new_actions[0, t - new_t_start])
+        else:
+            max_jump, jump_joint = 0.0, "n/a"
+        updated = [c for c in chunk_history if 0 <= (t - c["t_start"]) < c["actions"].shape[1]]
+        updated.append({
+            "actions": new_actions,
+            "t_start": new_t_start,
+            "applied_t": t,
+        })
+        keep_n = 2 if ensemble_k < 0 else max_chunks
+        return updated[-keep_n:], max_jump, jump_joint
+
     def model_inference(self):
         global inference_lock
         global inference_actions
         global inference_timestep
+        global inference_state
+        global inference_error
+        global inference_duration
+        global inference_rpc_duration
         global inference_thread
         global pre_instruction_attention_vector
         # instruction = np.load(self.args.lang_embeddings_path, allow_pickle=True).item()
@@ -878,52 +1003,179 @@ class RosOperator(Node):
         end_pose1 = [[0.05, 0, 0.2, 0, 0, 0, 0.0] for _ in range(len(self.args.arm_end_pose_ctrl_topics))]
         robot_base_vel0 = [0, 0, 0]
         robot_base_vel1 = [0, 0, 0]
-        if self.args.use_arm_joint_state > 1:
-            # self.arm_joint_state_ctrl(joint_state0)
-            self.arm_joint_state_ctrl_linear_interpolation_thread(joint_state0, True, calc_step=True)
-        if self.args.use_arm_end_pose > 1:
-            self.arm_end_pose_ctrl(end_pose0)
-            self.arm_joint_state_ctrl_linear_interpolation_thread(joint_state0, True, calc_step=True)
-            # self.arm_end_pose_ctrl_linear_interpolation_thread(end_pose0, True, calc_step=True)
-        if self.args.use_robot_base > 1:
-            self.robot_base_vel_ctrl(robot_base_vel0)
+        if not self.args.dry_run and not self.args.skip_init_pose:
+            if self.args.use_arm_joint_state > 1:
+                # self.arm_joint_state_ctrl(joint_state0)
+                self.arm_joint_state_ctrl_linear_interpolation_thread(joint_state0, True, calc_step=True)
+            if self.args.use_arm_end_pose > 1:
+                self.arm_end_pose_ctrl(end_pose0)
+                self.arm_joint_state_ctrl_linear_interpolation_thread(joint_state0, True, calc_step=True)
+                # self.arm_end_pose_ctrl_linear_interpolation_thread(end_pose0, True, calc_step=True)
+            if self.args.use_robot_base > 1:
+                self.robot_base_vel_ctrl(robot_base_vel0)
+        elif self.args.dry_run:
+            print("[DRY-RUN] Skipping startup pose move; NO control commands will be published.")
         pre_inference_status = -1
-        ctrl_rate = self.create_rate(30)
         all_actions = None
 
-        with torch.inference_mode():
+        infer_ctx = torch.inference_mode() if torch is not None else nullcontext()
+        with infer_ctx:
             while rclpy.ok():
                 t = 0
                 max_t = 0
+                all_actions = None
+                t_start = 0
+                cur_state = None
+                chunk_applied_t = 0
+                chunk_history = []
+                blend_total = max(0, int(self.args.chunk_blend_steps))
+                max_chunks = max(1, int(self.args.temporal_ensemble_max_chunks))
+                ensemble_k = float(self.args.temporal_ensemble_k)
+                ema_infer_s = 0.25
+                chunk_count = 0
+                ctrl_freq = max(float(self.args.ctrl_freq), 1.0)
                 if inference_thread is not None:
                     inference_thread.join()
                     inference_thread = None
                 while t < self.args.max_publish_step and rclpy.ok():
                     inference_status = self.get_inference_status()
                     if inference_status == -1:
-                        input("Please press any key to start inference:")
-                        self.set_inference_status(0)
+                        if self.args.dry_run:
+                            self.set_inference_status(0)
+                        else:
+                            input("Please press any key to start inference:")
+                            self.set_inference_status(0)
                     is_new_action = False
+                    if self.args.prefetch_steps >= 0:
+                        lead_steps = self.args.prefetch_steps
+                    else:
+                        lead_steps = math.ceil(ema_infer_s * ctrl_freq) + 1
+                    lead_steps = max(0, min(lead_steps, max(0, self.args.chunk_size - 2)))
                     if self.args.asynchronous_inference:
-                        if inference_thread is None and (self.args.pos_lookahead_step == 0 or t % self.args.pos_lookahead_step == 0 or t >= max_t) and self.check_frame():
+                        if all_actions is None or t >= max_t or self.args.pos_lookahead_step == 0:
+                            need_trigger = True
+                        else:
+                            target_switch_t = min(chunk_applied_t + self.args.pos_lookahead_step, max_t)
+                            trigger_t = max(chunk_applied_t, target_switch_t - lead_steps)
+                            need_trigger = (t >= trigger_t)
+                        if inference_thread is None and need_trigger and self.check_frame():
                             inference_thread = threading.Thread(target=inference_process,
                                                                 args=(self.args, t, self, policy))
                             inference_thread.start()
 
                         if inference_thread is not None and (not inference_thread.is_alive() or t >= max_t):
+                            wait_t0 = time.perf_counter()
+                            was_alive = inference_thread.is_alive()
                             inference_thread.join()
-                            inference_lock.acquire()
-                            inference_thread = None
-                            all_actions = inference_actions
-                            t_start = inference_timestep
-                            max_t = t_start + self.args.chunk_size
+                            wait_ms = (time.perf_counter() - wait_t0) * 1000.0 if was_alive else 0.0
+                            with inference_lock:
+                                inference_thread = None
+                                err = inference_error
+                                new_actions = inference_actions
+                                new_t_start = inference_timestep
+                                new_state = inference_state
+                                infer_dur_s = inference_duration
+                                rpc_dur_s = inference_rpc_duration
+                            if err is not None or new_actions is None or new_t_start is None:
+                                print(f"[ERROR] Inference failed ({err}); shutting down cleanly without publishing control commands.", flush=True)
+                                if rclpy.ok():
+                                    rclpy.shutdown()
+                                return
+                            eff_chunk_size = min(self.args.chunk_size, new_actions.shape[1])
+                            if t - new_t_start >= eff_chunk_size:
+                                print(
+                                    f"[WARN] Stale chunk discarded (t={t}, t_start={new_t_start}, eff_chunk_size={eff_chunk_size})",
+                                    flush=True,
+                                )
+                                if all_actions is None or t >= max_t:
+                                    continue
+                            else:
+                                chunk_history, max_jump, jump_joint = self._record_chunk(
+                                    chunk_history, new_actions, new_t_start, t, blend_total, ensemble_k, max_chunks
+                                )
+                                all_actions = new_actions
+                                t_start = new_t_start
+                                cur_state = new_state
+                                chunk_applied_t = t
+                                max_t = t_start + eff_chunk_size
+                                is_new_action = True
+                                chunk_count += 1
+                                if chunk_count > 1 and infer_dur_s is not None and 0.01 <= infer_dur_s <= 2.0:
+                                    ema_infer_s = 0.7 * ema_infer_s + 0.3 * infer_dur_s
+                                infer_ms = infer_dur_s * 1000.0 if infer_dur_s is not None else -1.0
+                                rpc_ms = rpc_dur_s * 1000.0 if rpc_dur_s is not None else -1.0
+                                print(
+                                    f"[ASYNC] chunk#{chunk_count} t={t} t_start={t_start} offset={t - t_start} "
+                                    f"infer={infer_ms:.1f}ms rpc={rpc_ms:.1f}ms wait={wait_ms:.1f}ms lead={lead_steps} "
+                                    f"max_jump={max_jump:.3f}rad({jump_joint}) ens={len(chunk_history)}",
+                                    flush=True,
+                                )
+                    else:
+                        need_sync = (
+                            all_actions is None
+                            or t >= max_t
+                            or self.args.pos_lookahead_step == 0
+                            or t >= chunk_applied_t + self.args.pos_lookahead_step
+                        )
+                        if need_sync and self.check_frame():
+                            inference_process(self.args, t, self, policy)
+                            with inference_lock:
+                                err = inference_error
+                                new_actions = inference_actions
+                                new_t_start = inference_timestep
+                                new_state = inference_state
+                            if err is not None or new_actions is None or new_t_start is None:
+                                print(f"[ERROR] Inference failed ({err}); shutting down cleanly without publishing control commands.", flush=True)
+                                if rclpy.ok():
+                                    rclpy.shutdown()
+                                return
+                            eff_chunk_size = min(self.args.chunk_size, new_actions.shape[1])
+                            chunk_history, _, _ = self._record_chunk(
+                                chunk_history, new_actions, new_t_start, t, blend_total, ensemble_k, max_chunks
+                            )
+                            all_actions = new_actions
+                            t_start = new_t_start
+                            cur_state = new_state
+                            chunk_applied_t = t
+                            max_t = t_start + eff_chunk_size
                             is_new_action = True
-                            inference_lock.release()
-                    if t >= max_t:
+                            chunk_count += 1
+                    if all_actions is None or t >= max_t:
+                        if self.args.dry_run:
+                            time.sleep(0.05)
+                            continue
                         print("inference time error")
+                        time.sleep(0.01)
                         continue
-                    raw_action = all_actions[:, t - t_start]
-                    raw_action = raw_action[0]
+                    if self.args.dry_run and is_new_action:
+                        dim_total = self.args.arm_joint_state_dim * len(self.args.arm_joint_state_names)
+                        chunk14 = all_actions[0, :, :dim_total]
+                        act0 = chunk14[0]
+                        delta0 = act0 - cur_state if cur_state is not None else act0 * 0.0
+                        g_vals = np.concatenate([chunk14[:, 6], chunk14[:, 13]]) if dim_total >= 14 else np.array([])
+                        would_clip = bool(
+                            g_vals.size > 0
+                            and (
+                                (g_vals < self.args.gripper_clip_min).any()
+                                or (self.args.gripper_clip_max > 0 and (g_vals > self.args.gripper_clip_max).any())
+                            )
+                        )
+                        print(f"[DRY-RUN t={t}] chunk_shape={all_actions.shape}, finite={bool(np.isfinite(all_actions).all())}")
+                        if cur_state is not None:
+                            print(f"  state      : {np.round(cur_state, 4)}")
+                        print(f"  action[0]  : {np.round(act0, 4)}")
+                        print(f"  delta[0]   : {np.round(delta0, 4)}")
+                        print(f"  chunk_min  : {np.round(chunk14.min(axis=0), 4)}")
+                        print(f"  chunk_max  : {np.round(chunk14.max(axis=0), 4)}")
+                        print(f"  grip_clip  : min={self.args.gripper_clip_min}, max={self.args.gripper_clip_max}, would_clip={would_clip}")
+                    raw_action, _ = self._compute_ensemble_action(chunk_history, t, blend_total, ensemble_k)
+                    if raw_action is None:
+                        raw_action = all_actions[0, t - t_start].copy()
+                    if self.args.dry_run:
+                        print("t:", t)
+                        t += 1
+                        time.sleep(1.0 / ctrl_freq)
+                        continue
                     if self.args.use_arm_joint_state > 1:
                         action_joint_state = raw_action[:self.args.arm_joint_state_dim * len(self.args.arm_joint_state_names)]
                         raw_action = raw_action[self.args.arm_joint_state_dim * len(self.args.arm_joint_state_names):]
@@ -943,6 +1195,11 @@ class RosOperator(Node):
                         self.robot_base_vel_ctrl(action_robot_base)
                     print("t:", t)
                     t += 1
+                if self.args.dry_run:
+                    print(f"[DRY-RUN] Reached max_publish_step={self.args.max_publish_step}, shutting down cleanly.")
+                    if rclpy.ok():
+                        rclpy.shutdown()
+                    break
 
     def get_camera_color_intrinsic(self, index):
         return self.camera_color_intrinsics[index]
@@ -1132,6 +1389,8 @@ class RosOperator(Node):
         return coeffs
 
     def arm_joint_state_ctrl(self, joint_states):
+        if self.args.dry_run:
+            return
         joint_state_msg = JointState()
         joint_state_msg.header = Header()
         joint_state_msg.header.stamp = self.get_clock().now().to_msg()
@@ -1140,10 +1399,19 @@ class RosOperator(Node):
         for i in range(len(joint_states)):
             joint_state_msg.position = [float(v) for v in joint_states[i]]
             joint_state_msg.position[6] += self.args.gripper_offset[i]
+            joint_state_msg.position[6] = max(self.args.gripper_clip_min, joint_state_msg.position[6])
+            if self.args.gripper_clip_max > 0:
+                joint_state_msg.position[6] = min(self.args.gripper_clip_max, joint_state_msg.position[6])
             self.arm_joint_state_ctrl_publisher[i].publish(joint_state_msg)
 
+    def _sleep_until(self, target_perf_time):
+        remaining = target_perf_time - time.perf_counter()
+        if remaining > 0:
+            time.sleep(remaining)
+
     def arm_joint_state_ctrl_interpolation(self, joint_states, is_new_action):
-        if self.last_ctrl_arm_joint_state is None:
+        is_first_step = (self.last_ctrl_arm_joint_state is None)
+        if is_first_step:
             last_ctrl_joint_state = np.concatenate(
                 [np.array(self.arm_joint_state_deques[i].right().position) for i in range(len(self.args.arm_joint_state_names))], axis=0)
         else:
@@ -1153,25 +1421,53 @@ class RosOperator(Node):
         ctrl_joint_state = np.concatenate(
                 [np.array(joint_state) for joint_state in joint_states], axis=0)
         joint_state_diff = ctrl_joint_state - last_ctrl_joint_state
+        max_abs_diff = float(np.max(np.abs(joint_state_diff)))
+        arm_dim = self.args.arm_joint_state_dim
+        arm_diffs = [
+            np.max(np.abs(joint_state_diff[i * arm_dim : (i + 1) * arm_dim - 1]))
+            for i in range(len(self.args.arm_joint_state_names))
+            if arm_dim > 1
+        ]
+        max_arm_abs_diff = float(max(arm_diffs)) if arm_diffs else max_abs_diff
 
-        if is_new_action or max(joint_state_diff) > 0.5:
-            append_to_history_list_step = 10
-            hz = 200
-            if max(joint_state_diff) > 0.5:
-                step = int(max([max(abs(joint_state_diff[i*self.args.arm_joint_state_dim: (i+1)*self.args.arm_joint_state_dim-1]) / np.array(self.args.arm_steps_length[:self.args.arm_joint_state_dim-1])) for i in range(len(self.args.arm_joint_state_names))]))
-            else:
-                step = 50
-            rate = self.create_rate(hz)
+        ctrl_freq = max(float(self.args.ctrl_freq), 1.0)
+        step_duration = 1.0 / ctrl_freq
+        normal_sub_steps = max(1, int(round(200.0 / ctrl_freq)))
+
+        if max_arm_abs_diff > 0.5:
+            step = max(1, int(max([max(abs(joint_state_diff[i*self.args.arm_joint_state_dim: (i+1)*self.args.arm_joint_state_dim-1]) / np.array(self.args.arm_steps_length[:self.args.arm_joint_state_dim-1])) for i in range(len(self.args.arm_joint_state_names))])))
+        elif is_new_action and self.args.new_action_smooth_step > 0:
+            step = int(self.args.new_action_smooth_step)
+        elif is_first_step and max_arm_abs_diff > 0.05:
+            step = min(50, max(normal_sub_steps, int(max_arm_abs_diff / 0.005)))
+        elif self.args.max_joint_delta > 0 and max_arm_abs_diff > self.args.max_joint_delta:
+            max_rad_per_sec = self.args.max_joint_delta * ctrl_freq
+            needed_duration = max_arm_abs_diff / max_rad_per_sec
+            step = max(normal_sub_steps + 1, int(math.ceil(needed_duration * 200.0)))
+            print(
+                f"[CLAMP] arm_diff={max_arm_abs_diff:.3f}rad > max_joint_delta={self.args.max_joint_delta:.3f}rad "
+                f"-> smooth {step} steps ({step * 5}ms)",
+                flush=True,
+            )
+        else:
+            step = 0
+
+        if step > 0:
+            sub_dt = 1.0 / 200.0
+            next_t = time.perf_counter()
             joint_state_list = np.linspace(last_ctrl_joint_state, ctrl_joint_state, step + 1)
             for i in range(1, len(joint_state_list)):
-                if self.arm_joint_state_ctrl_thread_return_lock.acquire(False):
+                if not rclpy.ok() or self.arm_joint_state_ctrl_thread_return_lock.acquire(False):
                     return
-                ctrl_joint_state = [joint_state_list[i][j*self.args.arm_joint_state_dim: (j+1)*self.args.arm_joint_state_dim] for j in range(len(self.args.arm_joint_state_names))]
-                self.arm_joint_state_ctrl(ctrl_joint_state)
-                if i % append_to_history_list_step == 0 or i + 1 == len(joint_state_list):
-                    self.arm_joint_state_ctrl_history_list.append(ctrl_joint_state)
-                rate.sleep()
-            self.arm_joint_state_ctrl_history_list = self.arm_joint_state_ctrl_history_list[-self.k:]
+                ctrl_joint_state_step = [joint_state_list[i][j*self.args.arm_joint_state_dim: (j+1)*self.args.arm_joint_state_dim] for j in range(len(self.args.arm_joint_state_names))]
+                self.arm_joint_state_ctrl(ctrl_joint_state_step)
+                next_t += sub_dt
+                self._sleep_until(next_t)
+            self.arm_joint_state_ctrl_history_list = [
+                [joint_state_list[max(0, step - (self.k - 1 - m) * normal_sub_steps)][j*self.args.arm_joint_state_dim: (j+1)*self.args.arm_joint_state_dim]
+                 for j in range(len(self.args.arm_joint_state_names))]
+                for m in range(self.k)
+            ]
             return
 
         if len(self.arm_joint_state_ctrl_history_list) == 0:
@@ -1180,15 +1476,16 @@ class RosOperator(Node):
         self.arm_joint_state_ctrl_history_list.append(joint_states)
         self.arm_joint_state_ctrl_history_list = self.arm_joint_state_ctrl_history_list[-self.k:]
         coeffs = [self.interpolation_param([self.arm_joint_state_ctrl_history_list[k][i][j] for k in range(self.k)]) for i in range(len(self.args.arm_joint_state_names)) for j in range(self.args.arm_joint_state_dim)]
-        hz = 200
-        step = 10
-        rate = self.create_rate(hz)
-        for i in range(step):
-            if self.arm_joint_state_ctrl_thread_return_lock.acquire(False):
+        sub_steps = normal_sub_steps
+        sub_dt = step_duration / sub_steps
+        next_t = time.perf_counter()
+        for i in range(sub_steps):
+            if not rclpy.ok() or self.arm_joint_state_ctrl_thread_return_lock.acquire(False):
                 return
-            ctrl_joint_state = [np.polyval(coeffs[j][::-1], (self.k - 2) + (i + 1) * (1.0 / step)) for j in range(len(coeffs))]
+            ctrl_joint_state = [np.polyval(coeffs[j][::-1], (self.k - 2) + (i + 1) * (1.0 / sub_steps)) for j in range(len(coeffs))]
             self.arm_joint_state_ctrl([ctrl_joint_state[j*self.args.arm_joint_state_dim: (j+1)*self.args.arm_joint_state_dim] for j in range(len(self.args.arm_joint_state_names))])
-            rate.sleep()
+            next_t += sub_dt
+            self._sleep_until(next_t)
 
     def arm_joint_state_ctrl_linear_interpolation(self, joint_states, calc_step):
         if self.last_ctrl_arm_joint_state is None:
@@ -1208,17 +1505,19 @@ class RosOperator(Node):
             step = 1 if step == 0 else step
         else:
             step = 10
-        rate = self.create_rate(hz)
+        sub_dt = 1.0 / hz
+        next_t = time.perf_counter()
         append_to_history_list_step = 10
         joint_state_list = np.linspace(last_ctrl_joint_state, ctrl_joint_state, step + 1)
         for i in range(1, len(joint_state_list)):
-            if self.arm_joint_state_ctrl_thread_return_lock.acquire(False):
+            if not rclpy.ok() or self.arm_joint_state_ctrl_thread_return_lock.acquire(False):
                 return
             ctrl_joint_state = [joint_state_list[i][j * self.args.arm_joint_state_dim: (j + 1) * self.args.arm_joint_state_dim] for j in range(len(self.args.arm_joint_state_names))]
             self.arm_joint_state_ctrl(ctrl_joint_state)
             if i % append_to_history_list_step == 0 or i + 1 == len(joint_state_list):
                 self.arm_joint_state_ctrl_history_list.append(ctrl_joint_state)
-            rate.sleep()
+            next_t += sub_dt
+            self._sleep_until(next_t)
         self.arm_joint_state_ctrl_history_list = self.arm_joint_state_ctrl_history_list[-self.k:]
         return
 
@@ -1249,6 +1548,8 @@ class RosOperator(Node):
             self.arm_joint_state_ctrl_thread.join()
 
     def arm_end_pose_ctrl(self, end_poses):
+        if self.args.dry_run:
+            return
         # print("left:", left)
         # print("right:", right)
         end_pose_msg = PoseStamped()
@@ -1295,7 +1596,8 @@ class RosOperator(Node):
             step = max([step_grasp, step_position])
         else:
             step = 10
-        rate = self.create_rate(hz)
+        sub_dt = 1.0 / hz
+        next_t = time.perf_counter()
 
         ctrl_traj_xyzg = []
         ctrl_traj_xyzw = []
@@ -1309,7 +1611,7 @@ class RosOperator(Node):
             ctrl_traj_xyzg.append(traj_xyzg)
             ctrl_traj_xyzw.append(traj_xyzw)
         for i in range(step):
-            if self.arm_end_pose_ctrl_thread_return_lock.acquire(False):
+            if not rclpy.ok() or self.arm_end_pose_ctrl_thread_return_lock.acquire(False):
                 return
             ctrl_end_poses = []
             for j in range(len(self.args.arm_end_pose_names)):
@@ -1319,7 +1621,8 @@ class RosOperator(Node):
                                  ctrl_traj_xyzg[j][i][3]]
                 ctrl_end_poses.append(ctrl_end_pose)
             self.arm_end_pose_ctrl(ctrl_end_poses)
-            rate.sleep()
+            next_t += sub_dt
+            self._sleep_until(next_t)
 
     def arm_end_pose_ctrl_linear_interpolation_thread(self, end_poses, block, calc_step):
         if self.arm_end_pose_ctrl_thread is not None:
@@ -1335,6 +1638,8 @@ class RosOperator(Node):
             self.arm_end_pose_ctrl_thread.join()
 
     def robot_base_vel_ctrl(self, vel):
+        if self.args.dry_run or self.robot_base_vel_ctrl_publisher is None:
+            return
         vel_msg = Twist()
         vel_msg.linear.x = vel[0]
         vel_msg.linear.y = vel[1]
@@ -1345,7 +1650,12 @@ class RosOperator(Node):
         self.robot_base_vel_ctrl_publisher.publish(vel_msg)
 
     def get_frame(self):
-        rate = self.create_rate(1)
+        if (
+            not self.args.use_camera_depth
+            and not self.args.use_camera_point_cloud
+            and not self.args.use_camera_color_depth_to_point_cloud
+        ):
+            self.all_config_exist = True
         while rclpy.ok() and not self.all_config_exist:
             self.all_config_exist = True
             if any(item is None for item in self.camera_color_intrinsics):
@@ -1366,7 +1676,7 @@ class RosOperator(Node):
             if not self.args.use_camera_color_depth_to_point_cloud and any(item is None for item in self.camera_point_cloud_extrinsics):
                 self.all_config_exist = False
                 print("camera point cloud extrinsic config not exist")
-            rate.sleep()
+            time.sleep(1.0)
 
         camera_colors = [self.camera_color_deques[i].right() for i in range(len(self.args.camera_color_names))]
         camera_depths = [self.camera_depth_deques[i].right() for i in range(len(self.args.camera_depth_names))]
@@ -1545,7 +1855,7 @@ def get_arguments():
     parser.add_argument('--rtc_prefix_attention_schedule', action='store', type=str, default='exp', help='RTC prefix attention schedule')
 
     # 服务器连接参数
-    parser.add_argument('--policy_server_host', action='store', type=str, default='127.0.1.1', help='Policy server host')
+    parser.add_argument('--policy_server_host', action='store', type=str, default='127.0.0.1', help='Policy server host')
     parser.add_argument('--policy_server_port', action='store', type=int, default=8010, help='Policy server port')
 
     parser.add_argument('--instruction_topic', action='store', type=str, help='instruction_topic',
@@ -1564,37 +1874,38 @@ def get_arguments():
                         default=['/camera_l/color/camera_info', '/camera_f/color/camera_info', '/camera_r/color/camera_info'],
                         required=False)
     parser.add_argument('--camera_depth_names', action='store', type=str, help='camera_depth_names',
-                        default=['left', 'front', 'right'],
+                        default=[],
                         required=False)
     parser.add_argument('--camera_depth_parent_frame_ids', action='store', type=str, help='camera_depth_parent_frame_ids',
-                        default=['camera_l_link', 'camera_f_link', 'camera_r_link'],
+                        default=[],
                         required=False)
     parser.add_argument('--camera_depth_topics', action='store', type=str, help='camera_depth_topics',
-                        default=['/camera_l/aligned_depth_to_color/image_raw', '/camera_f/aligned_depth_to_color/image_raw', '/camera_r/aligned_depth_to_color/image_raw'],
+                        default=[],
                         required=False)
     parser.add_argument('--camera_depth_config_topics', action='store', type=str, help='camera_depth_config_topics',
-                        default=['/camera_l/aligned_depth_to_color/camera_info', '/camera_f/aligned_depth_to_color/camera_info', '/camera_r/aligned_depth_to_color/camera_info'],
+                        default=[],
                         required=False)
     parser.add_argument('--use_camera_color_depth_to_point_cloud', action='store', type=bool, help='use_camera_color_depth_to_point_cloud',
-                        default=True,
+                        default=False,
                         required=False)
     parser.add_argument('--camera_point_cloud_names', action='store', type=str, help='camera_point_cloud_names',
-                        default=['left', 'front', 'right'],
+                        default=[],
                         required=False)
     parser.add_argument('--camera_point_cloud_parent_frame_ids', action='store', type=str, help='camera_point_cloud_parent_frame_ids',
-                        default=['camera_l_link', 'camera_f_link', 'camera_r_link'],
+                        default=[],
                         required=False)
     parser.add_argument('--camera_point_cloud_topics', action='store', type=str, help='camera_point_cloud_topics',
-                        default=['/camera_l/depth/color/points', '/camera_f/depth/color/points', '/camera_r/depth/color/points'],
+                        default=[],
                         required=False)
     parser.add_argument('--camera_point_cloud_config_topics', action='store', type=str, help='camera_point_cloud_config_topics',
-                        default=['/camera_l/aligned_depth_to_color/camera_info', '/camera_f/aligned_depth_to_color/camera_info', '/camera_r/aligned_depth_to_color/camera_info'],
+                        default=[],
                         required=False)
     parser.add_argument('--arm_joint_state_names', action='store', type=str, help='arm_joint_state_names',
                         default=['left', 'right'],
                         required=False)
     parser.add_argument('--arm_joint_state_topics', action='store', type=str, help='arm_joint_state_topics',
-                        default=['/joint_states_single_l', '/joint_states_single_r'],
+                        default=['/puppet/joint_left', '/puppet/joint_right'],
+                        #default=['/joint_states_single_l', '/joint_states_single_r'],
                         required=False)
     parser.add_argument('--arm_end_pose_names', action='store', type=str, help='arm_end_pose_names',
                         default=[],
@@ -1609,7 +1920,7 @@ def get_arguments():
                         default=[],
                         required=False)
     parser.add_argument('--arm_joint_state_ctrl_topics', action='store', type=str, help='arm_joint_state_ctrl_topics',
-                        default=['/joint_states_l', '/joint_states_r'],
+                        default=['/joint_left_states', '/joint_right_states'],
                         required=False)
     parser.add_argument('--arm_end_pose_ctrl_topics', action='store', type=str, help='arm_end_pose_ctrl_topics',
                         default=[],
@@ -1659,6 +1970,18 @@ def get_arguments():
                         default=False, required=False)
     parser.add_argument('--blocking_publish', action='store', type=bool, help='blocking_publish',
                         default=True, required=False)
+    parser.add_argument('--dry_run', action='store_true', help='Run inference without moving or publishing to robot topics')
+    parser.add_argument('--skip_init_pose', action='store_true', help='Skip moving arms to hardcoded joint_state0 on startup')
+    parser.add_argument('--pad_to_1280x720', action='store_true', help='Pad/crop camera images to 1280x720 before resize_with_pad')
+    parser.add_argument('--gripper_clip_min', action='store', type=float, default=0.0, help='Minimum gripper command clamp')
+    parser.add_argument('--gripper_clip_max', action='store', type=float, default=0.075, help='Maximum gripper command clamp (<=0 disables upper clamp)')
+    parser.add_argument('--ctrl_freq', action='store', type=float, default=30.0, help='Target action execution rate in Hz')
+    parser.add_argument('--prefetch_steps', action='store', type=int, default=-1, help='Lead steps ahead of target chunk switch to trigger next async inference (-1=auto from EMA inference time)')
+    parser.add_argument('--chunk_blend_steps', action='store', type=int, default=4, help='Steps over which to linearly blend from remaining old chunk to newly arrived chunk (0=disable)')
+    parser.add_argument('--new_action_smooth_step', action='store', type=int, default=0, help='Optional fixed 200 Hz sub-step ramp on chunk switch (0=disable legacy 250ms crawl)')
+    parser.add_argument('--temporal_ensemble_k', action='store', type=float, default=0.12, help='Exponential decay rate for ACT-style temporal ensembling across overlapping chunks (<0 disables multi-chunk ensembling)')
+    parser.add_argument('--temporal_ensemble_max_chunks', action='store', type=int, default=3, help='Maximum number of recent overlapping chunks retained in the temporal ensemble buffer')
+    parser.add_argument('--max_joint_delta', action='store', type=float, default=0.05, help='Max allowed per-step arm joint delta in radians before velocity-limited smoothing (<=0 disables moderate clamping)')
 
     args = parser.parse_args()
     return args
@@ -1668,7 +1991,14 @@ def main():
     args = get_arguments()
     rclpy.init()
     ros_operator = RosOperator(args)
-    rclpy.spin(ros_operator)
+    try:
+        rclpy.spin(ros_operator)
+    except Exception:
+        pass
+    finally:
+        ros_operator.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':
